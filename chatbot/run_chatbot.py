@@ -71,33 +71,111 @@ def loss_function(y_true, y_pred):
   return tf.reduce_mean(loss)
 
 
+class LearningRateSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """A LearningRateSchedule that uses an exponential decay schedule.
 
-# class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    When training a model, it is often useful to lower the learning rate as
+    the training progresses. This schedule applies an exponential decay function
+    to an optimizer step, given a provided initial learning rate.
 
-#   def __init__(self, d_model, warmup_steps=4000):
-#     super(CustomSchedule, self).__init__()
+    The schedule is a 1-arg callable that produces a decayed learning
+    rate when passed the current optimizer step. This can be useful for changing
+    the learning rate value across different invocations of optimizer functions.
+    It is computed as:
 
-#     self.d_model = d_model
-#     # self.d_model = tf.cast(self.d_model, tf.float32)
+    ```python
+    def decayed_learning_rate(step):
+      return initial_learning_rate * decay_rate ^ (step / decay_steps)
+    ```
 
-#     self.warmup_steps = warmup_steps
+    If the argument `staircase` is `True`, then `step / decay_steps` is
+    an integer division and the decayed learning rate follows a
+    staircase function.
 
-#   def __call__(self, step):
+    You can pass this schedule directly into a `tf.keras.optimizers.Optimizer`
+    as the learning rate.
+    Example: When fitting a Keras model, decay every 100000 steps with a base
+    of 0.96:
 
-#     # arg1 = tf.math.rsqrt(step + 1)
-#     # arg2 = step * (self.warmup_steps**-1.5)
-#     # return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+    ```python
+    initial_learning_rate = 0.1
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate,
+        decay_steps=100000,
+        decay_rate=0.96,
+        staircase=True)
 
-#     breakpoint()
+    model.compile(optimizer=tf.keras.optimizers.SGD(learning_rate=lr_schedule),
+                  loss='sparse_categorical_crossentropy',
+                  metrics=['accuracy'])
 
-#     step = float(step)
-#     arg1 = math.sqrt(step + 1)
-#     arg2 = step * (self.warmup_steps**-1.5)
-#     lr = math.sqrt(self.d_model) * min(arg1, arg2)
+    model.fit(data, labels, epochs=5)
+    ```
 
-#     print(step, arg1, arg2, lr)
+    The learning rate schedule is also serializable and deserializable using
+    `tf.keras.optimizers.schedules.serialize` and
+    `tf.keras.optimizers.schedules.deserialize`.
 
-#     return lr
+    Returns:
+      A 1-arg callable learning rate schedule that takes the current optimizer
+      step and outputs the decayed learning rate, a scalar `Tensor` of the same
+      type as `initial_learning_rate`.
+    """
+
+    def __init__(
+        self,
+        initial_learning_rate=0.001,
+        decay_steps=100000,
+        decay_rate=0.96,
+        staircase=False,
+        name=None,
+    ):
+        """Applies exponential decay to the learning rate.
+
+        Args:
+          initial_learning_rate: A scalar `float32` or `float64` `Tensor` or a
+            Python number.  The initial learning rate.
+          decay_steps: A scalar `int32` or `int64` `Tensor` or a Python number.
+            Must be positive.  See the decay computation above.
+          decay_rate: A scalar `float32` or `float64` `Tensor` or a
+            Python number.  The decay rate.
+          staircase: Boolean.  If `True` decay the learning rate at discrete
+            intervals
+          name: String.  Optional name of the operation.  Defaults to
+            'ExponentialDecay'.
+        """
+        super().__init__()
+        self.initial_learning_rate = initial_learning_rate
+        self.decay_steps = decay_steps
+        self.decay_rate = decay_rate
+        self.staircase = staircase
+        self.name = name
+
+    def __call__(self, step):
+        with tf.name_scope(self.name or "LearningRateSchedule") as name:
+            initial_learning_rate = tf.convert_to_tensor(
+                self.initial_learning_rate, name="initial_learning_rate"
+            )
+            dtype = initial_learning_rate.dtype
+            decay_steps = tf.cast(self.decay_steps, dtype)
+            decay_rate = tf.cast(self.decay_rate, dtype)
+
+            global_step_recomp = tf.cast(step, dtype)
+            p = global_step_recomp / decay_steps
+            if self.staircase:
+                p = tf.floor(p)
+            return tf.multiply(
+                initial_learning_rate, tf.pow(decay_rate, p), name=name
+            )
+
+    def get_config(self):
+        return {
+            "initial_learning_rate": self.initial_learning_rate,
+            "decay_steps": self.decay_steps,
+            "decay_rate": self.decay_rate,
+            "staircase": self.staircase,
+            "name": self.name,
+        }
 
 
 def evaluate(sentence):
@@ -131,7 +209,7 @@ def predict(sentence):
   return predicted_sentence
 
 
-def get_questions_answers():
+def get_conversation_data():
    
     path_to_zip = tf.keras.utils.get_file(
         'cornell_movie_dialogs.zip',
@@ -157,6 +235,13 @@ def get_questions_answers():
 
     print('Sample question: {}'.format(questions[20]))
     print('Sample answer: {}'.format(answers[20]))
+
+    return questions, answers
+
+
+def get_tokenizer(sentence_pairs):
+
+    questions, answers = sentence_pairs
 
     # Build tokenizer using tfds for both questions and answers
     tokenizer = tfds.features.text.SubwordTextEncoder.build_from_corpus(
@@ -197,16 +282,57 @@ def get_questions_answers():
     return questions, answers, tokenizer, VOCAB_SIZE, START_TOKEN, END_TOKEN
 
 
+class Tokenizer(object):
+   
+    def __init__(self, questions, answers):
 
-def custom_learning_rate_scheduler(epoch, lr):
-  if epoch < 10:
-    return lr
-  else:
-    return lr * tf.math.exp(-0.1)
+        # Build tokenizer using tfds for both questions and answers
+        self.tokenizer = tfds.features.text.SubwordTextEncoder.build_from_corpus(
+            questions + answers, target_vocab_size=2**13)
 
-custom_learning_rate = tf.keras.callbacks.LearningRateScheduler(
-   custom_learning_rate_scheduler
-)
+        # Define start and end token to indicate the start and end of a sentence
+        self.START_TOKEN, self.END_TOKEN = [tokenizer.vocab_size], [tokenizer.vocab_size + 1]
+
+        # Vocabulary size plus start and end token
+        self.VOCAB_SIZE = self.tokenizer.vocab_size + 2
+
+        print('Sample question: {}'.format(questions[20]))
+        print('Tokenized sample question: {}'.format(tokenizer.encode(questions[20])))
+
+        self.questions, self.answers = self.tokenize_and_filter(questions, answers)
+
+    # Tokenize, filter and pad sentences
+    def tokenize_and_filter(self, inputs, outputs):
+        tokenized_inputs, tokenized_outputs = [], []
+        
+        for (sentence1, sentence2) in zip(inputs, outputs):
+            # tokenize sentence
+            sentence1 = START_TOKEN + tokenizer.encode(sentence1) + END_TOKEN
+            sentence2 = START_TOKEN + tokenizer.encode(sentence2) + END_TOKEN
+            # check tokenized sentence max length
+            if len(sentence1) <= MAX_LENGTH and len(sentence2) <= MAX_LENGTH:
+                tokenized_inputs.append(sentence1)
+                tokenized_outputs.append(sentence2)
+        
+        # pad tokenized sentences
+        tokenized_inputs = tf.keras.preprocessing.sequence.pad_sequences(
+            tokenized_inputs, maxlen=MAX_LENGTH, padding='post')
+        tokenized_outputs = tf.keras.preprocessing.sequence.pad_sequences(
+            tokenized_outputs, maxlen=MAX_LENGTH, padding='post')
+        
+        return tokenized_inputs, tokenized_outputs
+
+
+
+# def custom_learning_rate_scheduler(epoch, lr):
+#   if epoch < 10:
+#     return lr
+#   else:
+#     return lr * tf.math.exp(-0.1)
+
+# custom_learning_rate = tf.keras.callbacks.LearningRateScheduler(
+#    custom_learning_rate_scheduler
+# )
 
 
 ###############################################################################
@@ -216,14 +342,15 @@ custom_learning_rate = tf.keras.callbacks.LearningRateScheduler(
 if __name__ == "__main__":
 
 
-    # sample_learning_rate = CustomSchedule(d_model=128)
+    # sample_learning_rate = LearningRateSchedule()
     # plt.plot(sample_learning_rate(tf.range(200000, dtype=tf.float32)))
     # plt.ylabel("Learning Rate")
     # plt.xlabel("Train Step")
     # plt.savefig("sample_learning_rate.png")
 
+    sentence_pairs = get_conversation_data()
 
-    questions, answers, tokenizer, VOCAB_SIZE, START_TOKEN, END_TOKEN = get_questions_answers()
+    questions, answers, tokenizer, VOCAB_SIZE, START_TOKEN, END_TOKEN = get_tokenizer(sentence_pairs)
 
 
     print('Vocab size: {}'.format(VOCAB_SIZE))
@@ -266,11 +393,11 @@ if __name__ == "__main__":
         num_heads=NUM_HEADS,
         dropout=DROPOUT)
 
-    # learning_rate = CustomSchedule(0.01)
     # learning_rate = CustomSchedule(D_MODEL)
+    learning_rate = LearningRateSchedule()
 
     optimizer = tf.keras.optimizers.Adam(
-       beta_1=0.9, beta_2=0.98, epsilon=1e-9,
+       learning_rate=learning_rate, beta_1=0.9, beta_2=0.98, epsilon=1e-9,
     )
 
     def accuracy(y_true, y_pred):
@@ -280,7 +407,7 @@ if __name__ == "__main__":
 
     model.compile(optimizer=optimizer, loss=loss_function, metrics=[accuracy])
 
-    model.fit(dataset, epochs=EPOCHS, callbacks=[custom_learning_rate])
+    model.fit(dataset, epochs=EPOCHS)
 
 
     def evaluate(sentence):
@@ -320,8 +447,6 @@ if __name__ == "__main__":
 
         return predicted_sentence
     
-
-    output = predict('Where have you been?')
 
     # feed the model with its previous output
     sentence = 'I am not crazy, my mother had me tested.'
